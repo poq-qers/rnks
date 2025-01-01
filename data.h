@@ -23,7 +23,18 @@ struct answer {
                // provided as program argument
 };
 
-int timeval_subtract(struct timeval *result, struct timeval *x, struct timeval *y);
-void checkInputSend(int argc, char* argv[]);
-void checkInputRec(int argc, char* argv[]);
-void setnonblocking(int* sock);
+struct networkContainer {
+    // Allgemein
+    int socket;
+    const char* multicast_address;
+    int port;
+    int window_size;
+    struct sockaddr_in6 my_addr;
+    struct sockaddr_in6 remote_addr;
+    int rec_numbers[10];
+    const char* filename;
+
+    // Receiver
+    int serialID;
+    int error_packets;
+};

@@ -5,7 +5,7 @@
 #include <sys/types.h>
 #include <fcntl.h>
 
-#include "helpFunctions.h"
+#include "functions.h"
 
 int timeval_subtract(struct timeval *result, struct timeval *x, struct timeval *y) {
     if (x->tv_usec < y->tv_usec) {

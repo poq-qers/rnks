@@ -7,8 +7,10 @@
 #include <sys/time.h>
 #include <sys/types.h>
 #include <errno.h>
+#include <stdbool.h>
 
-#include "helpFunctions.h"
+#include "functions.h"
+#include "data.h"
 
 #define BUFFER_SIZE 1024
 
@@ -70,7 +72,43 @@ void sendNack(int* udp_socket, struct sockaddr_in6* rec_addr, struct sockaddr_in
     }
 }
 
-void connectPhase(int* udp_socket, struct sockaddr_in6* rec_addr, socklen_t address_length, const char* filename, int serialID, 
+bool connectPhase(int* udp_socket, struct sockaddr_in6* my_addr, int serialID, struct sockaddr_in6* rec_addr, socklen_t address_length) {
+
+    struct request req;
+    struct answer answ;
+    answ.AnswType = AnswHello;
+    answ.recNr = serialID;
+
+    struct timeval* timeout = NULL;
+
+    fd_set read_fds;
+    FD_ZERO(&read_fds);
+    FD_SET(*udp_socket, &read_fds);
+    int retval = select(*udp_socket + 1, &read_fds, NULL, NULL, timeout);
+    if (retval == -1) {
+        perror("select error");
+        close(*udp_socket);
+        return false;
+    } else {
+        if (recvfrom(*udp_socket, (char*)&req, sizeof(req), 0, (struct sockaddr *)rec_addr, &address_length) < 0) {
+            perror("recvfrom error");
+            close(*udp_socket);
+            return false;
+        }
+
+        if(req.ReqType == ReqHello) {
+            if (sendto(*udp_socket, &answ, sizeof(answ), 0, (struct sockaddr *)rec_addr, sizeof(*rec_addr)) < 0) {
+                perror("sendto error");
+                close(*udp_socket);
+                return false;
+            }
+        }
+    }
+
+    return true;
+}
+
+void dataPhase(int* udp_socket, struct sockaddr_in6* rec_addr, socklen_t address_length, const char* filename, int serialID, 
                  struct sockaddr_in6* my_addr, int error_packets) {
     
     // ------------------------------------------- Variablen setzen -------------------------------------------
@@ -84,7 +122,6 @@ void connectPhase(int* udp_socket, struct sockaddr_in6* rec_addr, socklen_t addr
     fd_set read_fds;
     struct timeval timeout;
     int counter = 1;
-    int line = 1;
 
     // Beispiel: ähnliche Zeitmessung wie beim Sender
     struct timeval slice_start, now, diff;
@@ -134,6 +171,19 @@ void connectPhase(int* udp_socket, struct sockaddr_in6* rec_addr, socklen_t addr
                 }
             }
 
+            if(req.ReqType == ReqClose) {
+                    struct answer answ;
+                    answ.AnswType = AnswClose;
+                    answ.recNr = serialID;
+
+                    if (sendto(*udp_socket, &answ, sizeof(answ), 0, (struct sockaddr *)rec_addr, sizeof(*rec_addr)) < 0) {
+                        perror("sendto error");
+                        close(*udp_socket);
+                        exit(EXIT_SUCCESS);
+                    }
+                    break;
+            }
+
             // ----------------------------- restliche Zeit des Zeitschlitzes warten (nie) -----------------------------
 
             gettimeofday(&now, NULL);
@@ -146,14 +196,14 @@ void connectPhase(int* udp_socket, struct sockaddr_in6* rec_addr, socklen_t addr
 
             // ----------------------------- Nachricht checken -----------------------------
             // Error-Case
-            /*
-            if(counter == 10 || counter == 20 || counter == 30) {
+            
+            /*if(counter == 10 || counter == 20 || counter == 30) {
                 req.SeNr = 999L;
-            } */
+            }*/
 
             // Check
             if(rightSeq != (int)req.SeNr) {
-                printf("Sende NACK!\n");
+                printf("Send NACK - SN: %d\n", (int)req.SeNr);
                 sendNack(udp_socket, rec_addr, my_addr, rightSeq, serialID);
             } else {
                 if(rightSeq < window_size) 
@@ -162,12 +212,12 @@ void connectPhase(int* udp_socket, struct sockaddr_in6* rec_addr, socklen_t addr
                    rightSeq = 0;
 
                 // ----------------------------- Nachricht verarbeiten -----------------------------
-                printf("Data received - Line %d - SN: %ld\n", line, req.SeNr);
+
+                printf("Data received - Line %d - SN: %ld\n", counter, req.SeNr);
                 fprintf(file, "%s", req.name);
-                line++;
             }
             
-            if (strstr(req.name, "escape") != NULL) break;
+            //if (strstr(req.name, "escape") != NULL) break;
             counter++;
         }
     }
@@ -197,7 +247,13 @@ int main(int argc, char* argv[]) {
     int error_packets = 10; // atoi(argv[10]);
 
     prepareComm(&udp_socket, &my_addr, &mreq, multicast_address, port);
-    connectPhase(&udp_socket, &rec_addr, address_length, filename, serialID, &my_addr, error_packets);
+    if(!connectPhase(&udp_socket, &my_addr, serialID, &rec_addr, address_length)) {
+        printf("Es wurde kein Sender auf dieser Adresse gefunden.\n");
+    } else {
+        printf("Start Receiving:\n");
+        dataPhase(&udp_socket, &rec_addr, address_length, filename, serialID, &my_addr, error_packets);
+    }
+    
 
     // Close the socket
     close(udp_socket);
