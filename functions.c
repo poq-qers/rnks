@@ -4,6 +4,7 @@
 #include <sys/time.h>
 #include <sys/types.h>
 #include <fcntl.h>
+#include <stdbool.h>
 
 #include "functions.h"
 
@@ -51,14 +52,14 @@ void checkInputRec(int argc, char* argv[]) {
     }
 }
 
-void setnonblocking(int* sock) {
+bool setnonblocking(int* sock) {
     int flags, iResult;
 
     // Get the current flags
     flags = fcntl(*sock, F_GETFL, 0);
     if (flags == -1) {
         perror("fcntl failed");
-        return;
+        return false;
     }
 
     // Set the non-blocking flag
@@ -66,6 +67,8 @@ void setnonblocking(int* sock) {
     iResult = fcntl(*sock, F_SETFL, flags);
     if (iResult == -1) {
         perror("fcntl failed");
-        return;
+        return false;
     }
+
+    return true;
 }

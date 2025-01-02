@@ -8,23 +8,24 @@
 #include <errno.h>
 #include <stdbool.h>
 
+#include "timer.h"
 #include "data.h"
 #include "functions.h"
 
-void prepareComm(struct networkContainer* container) {
+// ------------------------------------------------------- prepare -------------------------------------------------------
+bool prepareComm(networkContainer* container) {
     int multicast_ttl = 1; // Link-local scope
 
     // Create a UDP socket
     if ((container->socket = socket(AF_INET6, SOCK_DGRAM, 0)) < 0) {
         perror("socket");
-        exit(EXIT_FAILURE);
+        return false;
     }
 
     // Set the multicast TTL
     if (setsockopt(container->socket, IPPROTO_IPV6, IPV6_MULTICAST_HOPS, &multicast_ttl, sizeof(multicast_ttl)) < 0) {
         perror("setsockopt error");
-        close(container->socket);
-        exit(EXIT_FAILURE);
+        return false;
     }
 
     memset(&container->my_addr, 0, sizeof(container->my_addr));
@@ -32,28 +33,28 @@ void prepareComm(struct networkContainer* container) {
     container->my_addr.sin6_port = htons(container->port);
     if (inet_pton(AF_INET6, container->multicast_address, &container->my_addr.sin6_addr) <= 0) {
         perror("inet_pton error");
-        close(container->socket);
-        exit(EXIT_FAILURE);
+        return false;
     }
 
-    setnonblocking(&container->socket);
+    if(!setnonblocking(&container->socket)) return false;
+
+    return true;
 }
 
 
-// ------------------------------------------------ connect-Phase ------------------------------------------------
-bool connectPhase(struct networkContainer* container) {
+// ------------------------------------------------------- connect -------------------------------------------------------
+bool connectPhase(networkContainer* container) {
 
-    struct request req;
+    request req;
     req.ReqType = ReqHello;
-    req.FlNr = (long)(container->window_size * 2);
+    req.FlNr = (long)(container->window_size);
 
     if (sendto(container->socket, &req, sizeof(req), 0, (struct sockaddr *)&container->my_addr, sizeof(container->my_addr)) < 0) {
         perror("sendto error");
-        close(container->socket);
-        exit(EXIT_FAILURE);
+        return false;
     }
 
-    struct answer answ;
+    answer answ;
     socklen_t addr_len = sizeof(container->remote_addr);
 
     struct timeval timeout;
@@ -67,10 +68,8 @@ bool connectPhase(struct networkContainer* container) {
     int retval = select(container->socket + 1, &read_fds, NULL, NULL, &timeout);
     if (retval == -1) {
         perror("select error");
-        close(container->socket);
         return false;
     } else if (retval == 0) {
-        close(container->socket);
         return false;
     } else {
 
@@ -79,37 +78,32 @@ bool connectPhase(struct networkContainer* container) {
             ssize_t bytes = recvfrom(container->socket, (char*)&answ, sizeof(answ), 0, (struct sockaddr *)&container->remote_addr, &addr_len);
             
             if (bytes < 0) {
-                if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                    // Keine weiteren Daten verfügbar
-                    break;
-                }
+                if (errno == EAGAIN || errno == EWOULDBLOCK) break; // Keine weiteren Daten verfügbar
+
                 perror("recvfrom error");
-                close(container->socket);
-                exit(EXIT_FAILURE);
+                return false;
             }
             if (answ.AnswType == AnswHello) {
                 printf("Hello ACK received - recNr: %d\n", answ.recNr);
                 container->rec_numbers[counter] = answ.recNr;
                 counter++;
-            }  
-
+            }
         }
-        
     }
-
     return true;
 }
 
-// ------------------------------------------------ close-Phase ------------------------------------------------
-bool closePhase(struct networkContainer* container, char sequence_buffer[][300]) {
+// ------------------------------------------------------- close ------------------------------------------------------
+bool closePhase(networkContainer* container, int nextSN) {
+    char sequence_buffer[50][300];
     
-    struct request req;
+    request req;
     req.ReqType = ReqClose;
+    req.SeNr = (long)nextSN;
 
     if (sendto(container->socket, &req, sizeof(req), 0, (struct sockaddr *)&container->my_addr, sizeof(container->my_addr)) < 0) {
         perror("sendto error");
-        close(container->socket);
-        exit(EXIT_FAILURE);
+        return false;
     }
 
     struct timeval timeout;
@@ -120,16 +114,14 @@ bool closePhase(struct networkContainer* container, char sequence_buffer[][300])
     FD_ZERO(&read_fds);
     FD_SET(container->socket, &read_fds);
 
-    struct answer answ;
+    answer answ;
     socklen_t addr_len = sizeof(container->remote_addr);
 
     int retval = select(container->socket + 1, &read_fds, NULL, NULL, &timeout);
     if (retval == -1) {
         perror("select error");
-        close(container->socket);
         return false;
     } else if (retval == 0) {
-        close(container->socket);
         return true;
     } else {
 
@@ -137,13 +129,10 @@ bool closePhase(struct networkContainer* container, char sequence_buffer[][300])
             ssize_t bytes = recvfrom(container->socket, (char*)&answ, sizeof(answ), 0, (struct sockaddr *)&container->remote_addr, &addr_len);
             
             if (bytes < 0) {
-                if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                    // Keine weiteren Daten verfügbar
-                    break;
-                }
+                if (errno == EAGAIN || errno == EWOULDBLOCK) break; // Keine weiteren Daten verfügbar
+
                 perror("recvfrom error");
-                close(container->socket);
-                exit(EXIT_FAILURE);
+                return false;
             }
             if (answ.AnswType == AnswClose) {
                 printf("ACK Close erhalten von rec: %d\n", answ.recNr);
@@ -156,8 +145,7 @@ bool closePhase(struct networkContainer* container, char sequence_buffer[][300])
 
                 if (sendto(container->socket, &req, sizeof(req), 0, (struct sockaddr *)&container->my_addr, sizeof(container->my_addr)) < 0) {
                     perror("sendto error");
-                    close(container->socket);
-                    exit(EXIT_FAILURE);
+                    return false;
                 }
             }
 
@@ -168,147 +156,129 @@ bool closePhase(struct networkContainer* container, char sequence_buffer[][300])
     return true;
 }
 
+// ------------------------------------------------------- data ------------------------------------------------------
+void showWindow(request window[], int base) {
+    // Show Window-Size
+        for(int i = 0; i < 20; i++) {
+            request* pkt = &window[i];
+            if(pkt->SeNr != 999L) {
+                printf("%ld ", pkt->SeNr);
+            } else {
+                printf("X ");
+            }
+        }
+        printf("  %d\n", base);
+}
 
-bool dataPhase(struct networkContainer* container) {
-
-    // ------------------------------------------- Variablen erstellen -------------------------------------------
-    // Time - Var
-    struct timeval last_send_time, now, diff;
-    struct timeval timeout;
-    fd_set read_fds;
-    gettimeofday(&last_send_time, NULL);
-
-    socklen_t address_length = sizeof(container->remote_addr);
-
-    int first_packet = 1; // erste Paket schicken -> ohne Warten
-    int window_buffersize = container->window_size * 2;
-    char sequence_buffer[window_buffersize][300];
-    int escape = 0;
-    bool res = false;
-
-    struct request req;
-    struct answer answ;
-
+bool dataPhase(networkContainer* container) {
+    
+    answer answ;
+    int window_size = 2 * container->window_size;
+    
     FILE* file = fopen(container->filename, "r");
     if (file == NULL) {
         perror("fopen error");
-        close(container->socket);
-        exit(EXIT_FAILURE);
+        return false;
     }
 
+    int base = 0;
+    int nextSN = 0;
+    request window[2 * MAX_WINDOW_SIZE];
+    char line[300];
+
+    struct timeval timeout;
+    fd_set read_fds;
+    struct timeval last_send_time, now, diff;
+    gettimeofday(&last_send_time, NULL);
+
+    for(int i = 0; i < 20; i++)
+        window[i].SeNr = 999L;
+
     // ------------------------------------------- Haupt-Loop -------------------------------------------
-    while (1) {
-        // ------------------------------------------- Window-Size buffern -------------------------------------------
-        for(int i = 0; i < window_buffersize; i++) {
-            if(fgets(sequence_buffer[i], sizeof(sequence_buffer[i]), file) != NULL)
-            //    if(strcmp(sequence_buffer[i], "escape") == 0) escape = 1;
-            if(feof(file)) {
-                printf("End of File reached\n");
-                window_buffersize = i+1;
-                escape = 1;
+    while (true) {
+
+        while(nextSN < base + window_size && fgets(line, sizeof(line), file)) {
+
+            request* packet = &window[nextSN % window_size];
+            packet->ReqType = ReqData;
+            packet->SeNr = nextSN;
+            strncpy(packet->name, line, PufferSize - 1);
+
+            if (sendto(container->socket, packet, sizeof(*packet), 0, (struct sockaddr *)&container->my_addr, sizeof(container->my_addr)) < 0) {
+                    perror("sendto error");
+                    return false;
+            }
+            add_timer(nextSN, TIMEOUT_INTERVAL);
+            nextSN++;
+
+        }
+        gettimeofday(&last_send_time, NULL);
+
+        FD_ZERO(&read_fds);
+        FD_SET(container->socket, &read_fds);
+        timeout.tv_sec = 0;
+        timeout.tv_usec = 300000; // 300 ms
+
+        int res_sel = select(container->socket + 1, &read_fds, NULL, NULL, &timeout);
+
+        if(res_sel == -1) {
+            perror("select");
+        } else if (res_sel == 0) {
+            decrement_timer();
+        } else if(FD_ISSET(container->socket, &read_fds)) {
+            socklen_t addr_len = sizeof(container->remote_addr);
+            if (recvfrom(container->socket, &answ, sizeof(answ), 0, (struct sockaddr*)&container->remote_addr, &addr_len) < 0) {
+                perror("Error receiving NACK");
+            } else {
+                printf("NACK erhalten\n");
+            }
+        }
+
+        //showWindow(window, base);
+
+        gettimeofday(&now, NULL);
+        timeval_subtract(&diff, &now, &last_send_time);
+        long diff_ms = diff.tv_sec * 1000 + diff.tv_usec / 1000;
+        if (diff_ms < 300) {
+            usleep((300 - diff_ms) * 1000);
+        }
+
+        moveWindow(&base);
+
+        if(feof(file) && base == nextSN) {
+            printf("EOF reached.\n");
+            if(closePhase(container, nextSN)) {
+                printf("Programm erfolreich geschlossen.\n");
                 break;
             }
         }
-        
-        // ------------------------------------------- Window-Size senden -------------------------------------------
-        for(int i = 0; i < window_buffersize; i++) {
-
-                // ------------------------------------------- Zeitschlitz für NACK -------------------------------------------
-                FD_ZERO(&read_fds);
-                FD_SET(container->socket, &read_fds);
-
-                gettimeofday(&now, NULL);
-                timeval_subtract(&diff, &now, &last_send_time);
-                long diff_ms = diff.tv_sec * 1000 + diff.tv_usec / 1000;
-
-                timeout.tv_sec = 0;
-                if(first_packet)
-                    timeout.tv_usec = 0;
-                else 
-                    timeout.tv_usec = 300000 - diff_ms;
-
-                int select_result = select(container->socket + 1, &read_fds, NULL, NULL, &timeout);
-                if (select_result == -1) {
-                    perror("select error");
-                    close(container->socket);
-                    exit(EXIT_FAILURE);
-                }
-
-                // ------------------------------------------- NACK verarbeiten und erneut senden -------------------------------------------
-                if (FD_ISSET(container->socket, &read_fds)) {
-                    int nbytes = recvfrom(container->socket, (char*)&answ, sizeof(answ), 0, (struct sockaddr *)&container->remote_addr, &address_length);
-                    if (nbytes < 0) {
-                        if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                            // No data available, try again
-                            continue;
-                        } else {
-                            perror("recvfrom error");
-                            close(container->socket);
-                            exit(EXIT_FAILURE);
-                        }
-                    }
-
-                    /* ### Nachricht nochmal senden -> erstmal nur Mittelung erhalten
-                    req.ReqType = ReqData;
-                    int num = (int)answ.SeNo;
-                    req.FlNr = strlen(sequence_buffer[num]); // 1 Char = 1 Byte
-                    req.SeNr = num;
-                    strcpy(req.name, sequence_buffer[num]);
-
-                    if (sendto(container->socket, &req, sizeof(req), 0, (struct sockaddr *)my_addr, sizeof(*my_addr)) < 0) {
-                        perror("sendto error");
-                        close(container->socket);
-                        exit(EXIT_FAILURE);
-                    } */
-
-                    printf("NACK received - SN: %d\n", (int)answ.SeNo);
-
-                    gettimeofday(&last_send_time, NULL);
-
-                 } else {
-                 // ------------------------------------------- Nächstes Paket senden -------------------------------------------
-                    req.ReqType = ReqData;
-                    req.FlNr = strlen(sequence_buffer[i]);
-                    req.SeNr = i;
-                    strcpy(req.name, sequence_buffer[i]);
-
-                    if (sendto(container->socket, &req, sizeof(req), 0, (struct sockaddr *)&container->my_addr, sizeof(container->my_addr)) < 0) {
-                        perror("sendto error");
-                        close(container->socket);
-                        exit(EXIT_FAILURE);
-                    }
-
-                    gettimeofday(&last_send_time, NULL);
-
-                    first_packet = 0;
-                 }
-        }
-        if(escape == 1) res = closePhase(container, sequence_buffer);
-        if(res) return true;
-        //else if(escape == 1) escape++;
     }
 
     fclose(file);
+    return true;
 }
 
 int main(int argc, char* argv[]) {
 
-    struct networkContainer container;
+    // checkInputSend(argc, argv); //-> ausgeschaltet um einfacher zu machen 
+
+    networkContainer container;
     container.socket = 0;
     container.multicast_address = "FF02::1"; //argv[2];
     container.port = 9800;                   //atoi(argv[4]);
     container.filename = "mytext.txt";       //argv[6];
     container.window_size = 1;               //atoi(argv[8]);
 
-    // checkInputSend(argc, argv); //-> ausgeschaltet um einfacher zu machen 
-
-    prepareComm(&container);
-    if(!connectPhase(&container)) {
-        printf("No HELLO ACK received.\n");
-    } else {
-        printf("Start Sending to %s\n", container.multicast_address);
-        dataPhase(&container);
+    if(prepareComm(&container)) {
+        if(connectPhase(&container)) {
+            printf("Start Sending to %s\n", container.multicast_address);
+            if(!dataPhase(&container))
+                printf("Error while sending data.\n");
+        } else {
+            printf("No HELLO ACK received.\n");
+        }
     }
 
+    close(container.socket);
     return 0;
 }

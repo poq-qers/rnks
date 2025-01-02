@@ -9,97 +9,99 @@
 #include <errno.h>
 #include <stdbool.h>
 
+#include "timer.h"
 #include "functions.h"
 #include "data.h"
 
 #define BUFFER_SIZE 1024
 
-void prepareComm(int* udp_socket, struct sockaddr_in6* my_addr, struct ipv6_mreq* mreq, const char* multicast_address, int port) {
+// ------------------------------------------------------- prepare ------------------------------------------------------
+bool prepareComm(networkContainer* container) {
+    struct ipv6_mreq mreq;
+
     // Create a UDP socket
-    if ((*udp_socket = socket(AF_INET6, SOCK_DGRAM, 0)) < 0) {
+    if ((container->socket = socket(AF_INET6, SOCK_DGRAM, 0)) < 0) {
         perror("socket error");
-        exit(EXIT_FAILURE);
+        return false;
     }
 
     // Allow multiple sockets to use the same port number
     int reuse = 1;
-    if (setsockopt(*udp_socket, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) < 0) {
+    if (setsockopt(container->socket, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) < 0) {
         perror("setsockopt error");
-        close(*udp_socket);
-        exit(EXIT_FAILURE);
+        return false;
     }
 
     // Bind to the local address and port
-    memset(my_addr, 0, sizeof(*my_addr));
-    my_addr->sin6_family = AF_INET6;
-    my_addr->sin6_port = htons(port);
-    my_addr->sin6_addr = in6addr_any;
+    memset(&container->my_addr, 0, sizeof(container->my_addr));
+    container->my_addr.sin6_family = AF_INET6;
+    container->my_addr.sin6_port = htons(container->port);
+    container->my_addr.sin6_addr = in6addr_any;
 
-    if (bind(*udp_socket, (struct sockaddr *)my_addr, sizeof(*my_addr)) < 0) {
+    if (bind(container->socket, (struct sockaddr *)&container->my_addr, sizeof(container->my_addr)) < 0) {
         perror("bind");
-        close(*udp_socket);
-        exit(EXIT_FAILURE);
+        return false;
     }
 
     // Join the multicast group
-    if (inet_pton(AF_INET6, multicast_address, &mreq->ipv6mr_multiaddr) <= 0) {
+    if (inet_pton(AF_INET6, container->multicast_address, &mreq.ipv6mr_multiaddr) <= 0) {
         perror("inet_pton");
-        close(*udp_socket);
-        exit(EXIT_FAILURE);
+        return false;
     }
-    mreq->ipv6mr_interface = 0; // 0 for default interface
+    mreq.ipv6mr_interface = 0; // 0 for default interface
 
-    if (setsockopt(*udp_socket, IPPROTO_IPV6, IPV6_JOIN_GROUP, mreq, sizeof(*mreq)) < 0) {
+    if (setsockopt(container->socket, IPPROTO_IPV6, IPV6_JOIN_GROUP, &mreq, sizeof(mreq)) < 0) {
         perror("setsockopt");
-        close(*udp_socket);
-        exit(EXIT_FAILURE);
+        return false;
     }
 
-    setnonblocking(udp_socket);
+    if(!setnonblocking(&container->socket)) return false;
+
+    return true;
 }
 
-void sendNack(int* udp_socket, struct sockaddr_in6* rec_addr, struct sockaddr_in6* my_addr, int rightSeq, int serialID) {
+// ------------------------------------------------------- send NACK ------------------------------------------------------
+void sendNack(networkContainer* container, int rightSeq) {
 
-    struct answer answ;
+    answer answ;
     answ.AnswType = AnswNACK;
     answ.SeNo = rightSeq;
-    answ.recNr = serialID;
+    answ.recNr = container->serialID;
 
-    if (sendto(*udp_socket, (const char*)&answ, sizeof(answ), 0, (struct sockaddr *)rec_addr, sizeof(*rec_addr)) < 0) {
+    if (sendto(container->socket, (const char*)&answ, sizeof(answ), 0, (struct sockaddr *)&container->remote_addr, sizeof(container->remote_addr)) < 0) {
         perror("sendto error");
-        close(*udp_socket);
         exit(EXIT_FAILURE);
     }
 }
 
-bool connectPhase(int* udp_socket, struct sockaddr_in6* my_addr, int serialID, struct sockaddr_in6* rec_addr, socklen_t address_length) {
+// ------------------------------------------------------- connect ------------------------------------------------------
+bool connectPhase(networkContainer* container , socklen_t* address_length) {
 
-    struct request req;
-    struct answer answ;
+    request req;
+    answer answ;
     answ.AnswType = AnswHello;
-    answ.recNr = serialID;
+    answ.recNr = container->serialID;
 
     struct timeval* timeout = NULL;
 
     fd_set read_fds;
     FD_ZERO(&read_fds);
-    FD_SET(*udp_socket, &read_fds);
-    int retval = select(*udp_socket + 1, &read_fds, NULL, NULL, timeout);
+    FD_SET(container->socket, &read_fds);
+    int retval = select(container->socket + 1, &read_fds, NULL, NULL, timeout);
     if (retval == -1) {
         perror("select error");
-        close(*udp_socket);
         return false;
     } else {
-        if (recvfrom(*udp_socket, (char*)&req, sizeof(req), 0, (struct sockaddr *)rec_addr, &address_length) < 0) {
+        if (recvfrom(container->socket, (char*)&req, sizeof(req), 0, (struct sockaddr *)&container->remote_addr, address_length) < 0) {
             perror("recvfrom error");
-            close(*udp_socket);
             return false;
         }
 
+        container->window_size = req.FlNr;
+
         if(req.ReqType == ReqHello) {
-            if (sendto(*udp_socket, &answ, sizeof(answ), 0, (struct sockaddr *)rec_addr, sizeof(*rec_addr)) < 0) {
+            if (sendto(container->socket, &answ, sizeof(answ), 0, (struct sockaddr *)&container->remote_addr, sizeof(container->remote_addr)) < 0) {
                 perror("sendto error");
-                close(*udp_socket);
                 return false;
             }
         }
@@ -108,155 +110,159 @@ bool connectPhase(int* udp_socket, struct sockaddr_in6* my_addr, int serialID, s
     return true;
 }
 
-void dataPhase(int* udp_socket, struct sockaddr_in6* rec_addr, socklen_t address_length, const char* filename, int serialID, 
-                 struct sockaddr_in6* my_addr, int error_packets) {
+// ------------------------------------------------------- data ------------------------------------------------------
+bool receiveFirstPacket(networkContainer* container, socklen_t* address_length, request* buffer, int* rightReq, FILE* file) {
+    request req;
+    fd_set read_fds;
+    struct timeval* timeout = NULL;
+
+    FD_ZERO(&read_fds);
+    FD_SET(container->socket, &read_fds);
+
+    int retval = select(container->socket + 1, &read_fds, NULL, NULL, timeout);
+    if (retval == -1) {
+        perror("select error");
+        return false;
+    } else {
+        if (recvfrom(container->socket, (char*)&req, sizeof(req), 0, (struct sockaddr *)&container->remote_addr, address_length) < 0) {
+            perror("recvfrom error");
+            return false;
+        }
+
+        printf("Received SN: %d\n", *rightReq);
+        buffer[*rightReq] = req;
+        (*rightReq)++;
+        fprintf(file, "%s", req.name);
+
+        return true;
+
+    }
+
+    return false;
+}
+
+bool dataPhase(networkContainer* container, socklen_t* address_length) {
     
+    request buffer[2 * MAX_WINDOW_SIZE];
+    int base = 0;
+    int window_size = 2 * container->window_size;
     // ------------------------------------------- Variablen setzen -------------------------------------------
-    FILE* file = fopen(filename, "w");
+    FILE* file = fopen(container->filename, "w");
     if (file == NULL) {
         perror("fopen error");
-        close(*udp_socket);
-        exit(EXIT_FAILURE);
+        return false;
     }
 
     fd_set read_fds;
     struct timeval timeout;
-    int counter = 1;
 
     // Beispiel: ähnliche Zeitmessung wie beim Sender
-    struct timeval slice_start, now, diff;
+    struct timeval slice_start; // now, diff;
     gettimeofday(&slice_start, NULL);
 
-    struct request req;
-
-    // Window-Size -> später mit HELLO übermitteln
-    int window_size = 1; // alles größer F=1 -> 2*Windowsize oder Modulo -> mal schauen
-
+    request req;
     int rightSeq = 0; // 0 = immer Start
 
-    // Receive multicast messages
-    while (1) { 
+    if(!receiveFirstPacket(container, address_length, buffer, &rightSeq, file)) return false;
+    else base++;
+    // Einfach ausgehen, dass das erste Paket richtig ist
 
-        // ----------------------------- Timeout setzen -----------------------------
+    // Receive multicast messages
+    while (true) { 
+
         FD_ZERO(&read_fds);
-        FD_SET(*udp_socket, &read_fds);
+        FD_SET(container->socket, &read_fds);
 
         // Set timeout to 300 milliseconds
         timeout.tv_sec = 0;
-        timeout.tv_usec = 300000;
+        timeout.tv_usec = TIMEOUT_INTERVAL * TIMEOUT * 1000;
 
-        int select_result = select(*udp_socket + 1, &read_fds, NULL, NULL, &timeout);
+        int select_result = select(container->socket + 1, &read_fds, NULL, NULL, &timeout);
         if (select_result == -1) {
             perror("select error");
-            close(*udp_socket);
-            exit(EXIT_FAILURE);
+            return false;
         } else if (select_result == 0) {
-            // Timeout occurred, no data available
-            printf("No data received in the last 300ms\n");
-            continue;
+            printf("No data received in the last 900ms\n");
+            // SendNack(base) -> implementieren
         }
 
-        // ----------------------------- Nachricht empfangen -----------------------------
-        if (FD_ISSET(*udp_socket, &read_fds)) {
-
-            int nbytes = recvfrom(*udp_socket, (char*)&req, sizeof(req), 0, (struct sockaddr *)rec_addr, &address_length);
+        // receive packet
+        if (FD_ISSET(container->socket, &read_fds)) {
+            int nbytes = recvfrom(container->socket, (char*)&req, sizeof(req), 0, (struct sockaddr *)&container->remote_addr, address_length);
             if (nbytes < 0) {
                 if (errno == EAGAIN || errno == EWOULDBLOCK) {
                     // No data available, try again
                     continue;
                 } else {
                     perror("recvfrom error");
-                    close(*udp_socket);
-                    exit(EXIT_FAILURE);
+                    return false;
                 }
             }
 
-            if(req.ReqType == ReqClose) {
-                    struct answer answ;
-                    answ.AnswType = AnswClose;
-                    answ.recNr = serialID;
+            int SN = (int)req.SeNr;
+            if(SN == 10) SN = 11;
 
-                    if (sendto(*udp_socket, &answ, sizeof(answ), 0, (struct sockaddr *)rec_addr, sizeof(*rec_addr)) < 0) {
-                        perror("sendto error");
-                        close(*udp_socket);
-                        exit(EXIT_SUCCESS);
+            if (base <= SN && SN < (base + window_size)) {
+                buffer[base % window_size] = req;
+                if(SN != base) {
+                    printf("Send NACK - SN: %d, - base: %d\n", SN, base);
+                    sendNack(container, base);
+                    base++; // wegmachen, wenn NACK richtig funktioniert
+                } else {
+                    if(req.ReqType == ReqClose) {
+                        answer answ;
+                        answ.AnswType = AnswClose;
+                        answ.recNr = container->serialID;
+
+                        if (sendto(container->socket, &answ, sizeof(answ), 0, (struct sockaddr *)&container->remote_addr, sizeof(container->remote_addr)) < 0) {
+                            perror("sendto error");
+                            return false;
+                        }
+                        break;
                     }
-                    break;
+                    base = SN+1;
+                    // deliver data to applayer until base-1
+                    // erstmal Lösung
+                    printf("Received SN: %d\n", SN);
+                    fprintf(file, "%s", req.name);
+                }
             }
-
-            // ----------------------------- restliche Zeit des Zeitschlitzes warten (nie) -----------------------------
-
-            gettimeofday(&now, NULL);
-            timeval_subtract(&diff, &now, &slice_start);
-            long diff_ms = diff.tv_sec * 1000 + diff.tv_usec / 1000;
-            //printf("%ld\n", diff_ms); //-> nie sleepen da immer langsamer
-            if(diff_ms < 300) {
-                usleep((300 - diff_ms) * 1000);
-            }
-
-            // ----------------------------- Nachricht checken -----------------------------
-            // Error-Case
-            
-            /*if(counter == 10 || counter == 20 || counter == 30) {
-                req.SeNr = 999L;
-            }*/
-
-            // Check
-            if(rightSeq != (int)req.SeNr) {
-                printf("Send NACK - SN: %d\n", (int)req.SeNr);
-                sendNack(udp_socket, rec_addr, my_addr, rightSeq, serialID);
-            } else {
-                if(rightSeq < window_size) 
-                    rightSeq++;
-                else 
-                   rightSeq = 0;
-
-                // ----------------------------- Nachricht verarbeiten -----------------------------
-
-                printf("Data received - Line %d - SN: %ld\n", counter, req.SeNr);
-                fprintf(file, "%s", req.name);
-            }
-            
-            //if (strstr(req.name, "escape") != NULL) break;
-            counter++;
         }
     }
 
     fclose(file);
+    return true;
 }
 
 int main(int argc, char* argv[]) {
 
     if(argc < 2) {
         printf("Gebe bitte alle Argumente mit\n");
-        exit(EXIT_FAILURE);
+        return 1;
     }
-
-    int udp_socket = 0;
-    struct sockaddr_in6 my_addr, rec_addr;
-    struct ipv6_mreq mreq;
-    socklen_t address_length = sizeof(rec_addr);
 
     // checkInputRec(argc, argv); //-> kurz um ausgeschaltet um einfacher zu machen 
 
-    const char* multicast_address = "FF02::1"; //argv[2];
-    int port = 9800; //atoi(argv[4]);
-    const char* filename = "myout.txt"; //argv[6];
-    int serialID = atoi(argv[1]); //atoi(argv[8]);
+    networkContainer container;
+    container.socket = 0;
+    container.multicast_address = "FF02::01"; //argv[2];
+    container.port = 9800;                    //atoi(argv[4]);
+    container.filename = "myout.txt";         //argv[6];
+    container.serialID = atoi(argv[1]);       //atoi(argv[8]);
+    container.error_packets = 10;             // atoi(argv[10]); -> jedes x. Paket geht verloren
 
-    int error_packets = 10; // atoi(argv[10]);
+    socklen_t address_length = sizeof(container.remote_addr);
 
-    prepareComm(&udp_socket, &my_addr, &mreq, multicast_address, port);
-    if(!connectPhase(&udp_socket, &my_addr, serialID, &rec_addr, address_length)) {
-        printf("Es wurde kein Sender auf dieser Adresse gefunden.\n");
-    } else {
-        printf("Start Receiving:\n");
-        dataPhase(&udp_socket, &rec_addr, address_length, filename, serialID, &my_addr, error_packets);
+    if(prepareComm(&container)) {
+        if(connectPhase(&container, &address_length)) {
+            printf("Start Receiving:\n");
+            if(!dataPhase(&container, &address_length))
+                printf("Error while receiving.\n");
+        } else {
+            printf("Reached no one.\n");
+        }
     }
-    
 
-    // Close the socket
-    close(udp_socket);
-
+    close(container.socket);
     return 0;
 }

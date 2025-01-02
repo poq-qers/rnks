@@ -1,4 +1,6 @@
-struct request {
+#define MAX_WINDOW_SIZE 10
+
+typedef struct {
     unsigned char ReqType;
     #define ReqHello 'H'
     #define ReqData 'D'
@@ -10,9 +12,9 @@ struct request {
     char name[PufferSize];
     int recNr;  // unique number for different receiver on Loopback
                 // interface (eg. only set for retransmission, else zero)
-};
+} request;
 
-struct answer {
+typedef struct {
     unsigned char AnswType;
     #define AnswHello 'H'
     #define AnswNACK 'N' //Multicast Group receiver send
@@ -21,9 +23,9 @@ struct answer {
     unsigned SeNo;
     int recNr; // Random number for different receiver on Loopback, can be
                // provided as program argument
-};
+} answer;
 
-struct networkContainer {
+typedef struct {
     // Allgemein
     int socket;
     const char* multicast_address;
@@ -37,4 +39,4 @@ struct networkContainer {
     // Receiver
     int serialID;
     int error_packets;
-};
+} networkContainer;
