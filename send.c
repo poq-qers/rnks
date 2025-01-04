@@ -173,7 +173,7 @@ void showWindow(request window[], int base) {
 bool dataPhase(networkContainer* container) {
     
     answer answ;
-    int window_size = 2 * container->window_size;
+    int window_size = container->window_size;
     
     FILE* file = fopen(container->filename, "r");
     if (file == NULL) {
@@ -194,6 +194,8 @@ bool dataPhase(networkContainer* container) {
     for(int i = 0; i < 20; i++)
         window[i].SeNr = 999L;
 
+    int noNackCount = 0; // Add this counter
+
     // ------------------------------------------- Haupt-Loop -------------------------------------------
     while (true) {
 
@@ -210,7 +212,6 @@ bool dataPhase(networkContainer* container) {
             }
             add_timer(nextSN, TIMEOUT_INTERVAL);
             nextSN++;
-
         }
         gettimeofday(&last_send_time, NULL);
 
@@ -224,13 +225,44 @@ bool dataPhase(networkContainer* container) {
         if(res_sel == -1) {
             perror("select");
         } else if (res_sel == 0) {
-            decrement_timer();
+            noNackCount++; // Increment counter when no NACK received
+            
+            // After 3 timeouts, move window for F=1
+           if (noNackCount >= 3) {
+                decrement_timer();
+                //del_timer(base);
+                base = base + window_size; // Move window by one position (F=1)
+                noNackCount = 0; // Reset counter
+                //printf("Timeout after 3 intervals - moving window to base: %d\n", base);
+            }
         } else if(FD_ISSET(container->socket, &read_fds)) {
             socklen_t addr_len = sizeof(container->remote_addr);
             if (recvfrom(container->socket, &answ, sizeof(answ), 0, (struct sockaddr*)&container->remote_addr, &addr_len) < 0) {
                 perror("Error receiving NACK");
             } else {
-                printf("NACK erhalten\n");
+                // Prüfung auf richtigen Empfänger
+                bool inList = false;
+                for(int i = 0; i < 10; i++) {
+                    if(container->rec_numbers[i] == answ.recNr) inList = true;
+                }
+
+                if(inList) {
+                    noNackCount = 0;
+                    printf("NACK erhalten - SN: %d\n", answ.SeNo);
+
+                    del_timer(answ.SeNo);
+
+                    request* packet = &window[answ.SeNo % window_size];
+                    if (sendto(container->socket, packet, sizeof(*packet), 0, (struct sockaddr *)&container->remote_addr, sizeof(container->remote_addr)) < 0) {
+                        perror("sendto error");
+                        return false;
+                    }
+
+                    add_timer(answ.SeNo, TIMEOUT_INTERVAL);
+                } else {
+                    printf("NACK received, but %d not in list\n", answ.SeNo);
+                }
+
             }
         }
 
@@ -268,6 +300,9 @@ int main(int argc, char* argv[]) {
     container.port = 9800;                   //atoi(argv[4]);
     container.filename = "mytext.txt";       //argv[6];
     container.window_size = 1;               //atoi(argv[8]);
+
+    for(int i = 0; i < 10; i++)
+        container.rec_numbers[i] = -1;
 
     if(prepareComm(&container)) {
         if(connectPhase(&container)) {

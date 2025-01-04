@@ -109,6 +109,18 @@ bool connectPhase(networkContainer* container , socklen_t* address_length) {
 
     return true;
 }
+// ------------------------------------------------------- close ------------------------------------------------------
+bool sendClose(networkContainer* container) {
+    answer answ;
+    answ.AnswType = AnswClose;
+    answ.recNr = container->serialID;
+
+    if (sendto(container->socket, &answ, sizeof(answ), 0, (struct sockaddr *)&container->remote_addr, sizeof(container->remote_addr)) < 0) {
+        perror("sendto error");
+        return false;
+    }
+    return true;
+}
 
 // ------------------------------------------------------- data ------------------------------------------------------
 bool receiveFirstPacket(networkContainer* container, socklen_t* address_length, request* buffer, int* rightReq, FILE* file) {
@@ -144,8 +156,23 @@ bool receiveFirstPacket(networkContainer* container, socklen_t* address_length, 
 bool dataPhase(networkContainer* container, socklen_t* address_length) {
     
     request buffer[2 * MAX_WINDOW_SIZE];
+
     int base = 0;
-    int window_size = 2 * container->window_size;
+    int window_size = 0;
+    bool nack = false;
+    request nackBuffer[MAX_WINDOW_SIZE];
+    int nackCounter = 0;
+
+    for(int i = 0; i < 10; i++)
+        nackBuffer[i].SeNr = 999L;
+
+    // später fixen
+    if(container->window_size == 1) {
+        window_size = 2 * container->window_size;
+    } else {
+        window_size = container->window_size;
+    }
+
     // ------------------------------------------- Variablen setzen -------------------------------------------
     FILE* file = fopen(container->filename, "w");
     if (file == NULL) {
@@ -162,6 +189,7 @@ bool dataPhase(networkContainer* container, socklen_t* address_length) {
 
     request req;
     int rightSeq = 0; // 0 = immer Start
+    //bool firstTry = true;
 
     if(!receiveFirstPacket(container, address_length, buffer, &rightSeq, file)) return false;
     else base++;
@@ -200,34 +228,59 @@ bool dataPhase(networkContainer* container, socklen_t* address_length) {
             }
 
             int SN = (int)req.SeNr;
-            if(SN == 10) SN = 11;
+            /*
+            if(SN == 10 && firstTry == true) {
+                SN = 11;
+                firstTry = false;
+            }*/
 
-            if (base <= SN && SN < (base + window_size)) {
-                buffer[base % window_size] = req;
-                if(SN != base) {
-                    printf("Send NACK - SN: %d, - base: %d\n", SN, base);
-                    sendNack(container, base);
-                    base++; // wegmachen, wenn NACK richtig funktioniert
-                } else {
-                    if(req.ReqType == ReqClose) {
-                        answer answ;
-                        answ.AnswType = AnswClose;
-                        answ.recNr = container->serialID;
-
-                        if (sendto(container->socket, &answ, sizeof(answ), 0, (struct sockaddr *)&container->remote_addr, sizeof(container->remote_addr)) < 0) {
-                            perror("sendto error");
-                            return false;
-                        }
-                        break;
-                    }
-                    base = SN+1;
-                    // deliver data to applayer until base-1
-                    // erstmal Lösung
-                    printf("Received SN: %d\n", SN);
-                    fprintf(file, "%s", req.name);
-                }
+            if(req.ReqType == ReqClose) {
+                sendClose(container);
+                break;
             }
+
+            if(base == (int)req.SeNr) nack = false;
+            // buffern, nochmal schicken, gucken ob die anderen richtig sind
+            if(!nack) {
+                if (base <= SN && SN < (base + window_size)) {
+                    buffer[base % window_size] = req;
+                    if(SN != base) {
+                        nackCounter = 0;
+                        printf("Send NACK - SN: %d, - base: %d\n", SN, base);
+                        nack = true;
+                        sendNack(container, base);
+                    } else {
+                            if(req.ReqType == ReqClose) {
+                                sendClose(container);
+                                break;
+                            } else if(req.ReqType == ReqData) {
+
+                                printf("Received SN: %d\n", SN);
+                                fprintf(file, "%s", req.name);
+
+                                for(int i = 0; i < 10; i++) {
+                                    if((int)nackBuffer[i].SeNr != 999) {
+                                        printf("Received SN: %d\n", (int)nackBuffer[i].SeNr);
+                                        fprintf(file, "%s", nackBuffer[i].name);
+                                        base++;
+                                        nackBuffer[i].SeNr = 999L;
+                                    }
+                                }
+                    
+                                base++;
+                            }
+
+                    } 
+                } else {
+                    printf("SN: %d - nicht im window\n", SN);
+                }
+            } else {
+                nackBuffer[nackCounter] = req;
+                nackCounter++; 
+            }
+            
         }
+        
     }
 
     fclose(file);

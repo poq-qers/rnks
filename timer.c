@@ -89,6 +89,6 @@ void decrement_timer() {
 void moveWindow(int* base) {
     while (timer_list != NULL && timer_list->seq_num == *base) {
         del_timer(*base);
-        (*base)++;
+        //(*base)++;
     }
 }
