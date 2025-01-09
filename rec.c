@@ -189,7 +189,7 @@ bool dataPhase(networkContainer* container, socklen_t* address_length) {
 
     request req;
     int rightSeq = 0; // 0 = immer Start
-    //bool firstTry = true;
+    //bool firstTry = true; // -> nicht mehr auskommentieren, wenn NACK-testcase eingebaut
 
     if(!receiveFirstPacket(container, address_length, buffer, &rightSeq, file)) return false;
     else base++;
@@ -228,7 +228,8 @@ bool dataPhase(networkContainer* container, socklen_t* address_length) {
             }
 
             int SN = (int)req.SeNr;
-            /*
+
+            /* NACK testcase
             if(SN == 10 && firstTry == true) {
                 SN = 11;
                 firstTry = false;
